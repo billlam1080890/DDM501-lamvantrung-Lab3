@@ -1,0 +1,271 @@
+# =============================================================================
+# CI Pipeline for Movie Rating API
+# DDM501 - Lab 3: Testing & CI/CD
+#
+# Jobs:
+#   lint           - flake8 / black / isort
+#   type-check     - mypy
+#   test           - the 4-level test suite on Python 3.10 and 3.11 + coverage
+#   model-validate - the model must meet a minimum quality bar before merge
+#   docker-build   - the image must build and actually serve /health
+#   ci-success     - single required check for branch protection
+# =============================================================================
+
+name: CI Pipeline
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main]
+
+# A new push to the same branch cancels the previous run - no point paying for
+# CI on a commit that has already been superseded.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  PYTHON_DEFAULT: '3.11'
+
+jobs:
+  # ===========================================================================
+  # Linting Job
+  # ===========================================================================
+  lint:
+    name: Lint Code
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_DEFAULT }}
+          cache: 'pip'
+          cache-dependency-path: |
+            requirements.txt
+            requirements-dev.txt
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install flake8 black isort
+
+      - name: Run flake8
+        run: flake8 app/ tests/ scripts/ --max-line-length=100 --extend-ignore=E203,W503
+
+      - name: Check black formatting
+        run: black --check --line-length=100 app/ tests/ scripts/
+
+      - name: Check import sorting
+        run: isort --check-only --profile=black --line-length=100 app/ tests/ scripts/
+
+  # ===========================================================================
+  # Type Checking Job
+  # ===========================================================================
+  type-check:
+    name: Type Check
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_DEFAULT }}
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install mypy types-requests
+
+      - name: Run mypy
+        run: mypy app/ --ignore-missing-imports
+
+  # ===========================================================================
+  # Test Job
+  # ===========================================================================
+  test:
+    name: Test (Python ${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    needs: [lint]
+
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ['3.10', '3.11']
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: 'pip'
+          cache-dependency-path: |
+            requirements.txt
+            requirements-dev.txt
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt -r requirements-dev.txt
+
+      # MovieLens is ~5 MB and the model fits in seconds, so training in CI is
+      # cheaper and more honest than committing a 5 MB binary to git.
+      - name: Train model artifact
+        run: python scripts/train_model.py
+
+      - name: Run unit tests
+        run: pytest tests/unit/ -v --junitxml=junit-unit.xml
+
+      - name: Run integration tests
+        run: pytest tests/integration/ -v --junitxml=junit-integration.xml
+
+      - name: Run data quality tests
+        run: pytest tests/data/ -v --junitxml=junit-data.xml
+
+      - name: Run model behavioral tests
+        run: pytest tests/model/ -v --junitxml=junit-model.xml
+
+      - name: Full suite with coverage gate
+        run: |
+          pytest tests/ \
+            --cov=app \
+            --cov-report=term-missing \
+            --cov-report=xml \
+            --cov-fail-under=80
+
+      - name: Upload coverage report
+        if: matrix.python-version == '3.11'
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-report
+          path: coverage.xml
+
+      - name: Upload test results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-results-${{ matrix.python-version }}
+          path: junit-*.xml
+
+  # ===========================================================================
+  # Model Validation Job
+  # ===========================================================================
+  model-validate:
+    name: Validate Model Quality
+    runs-on: ubuntu-latest
+    needs: [test]
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_DEFAULT }}
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Train model
+        run: python scripts/train_model.py
+
+      - name: Enforce minimum model quality
+        # A change that silently degrades the model must fail the build rather
+        # than merge quietly. RMSE above 1.05 on MovieLens 100K means something
+        # is wrong with the data or the training configuration.
+        run: |
+          python - <<'EOF'
+          import pickle
+
+          from surprise import Dataset, accuracy
+          from surprise.model_selection import train_test_split
+
+          with open("models/svd_model.pkl", "rb") as fh:
+              model = pickle.load(fh)
+
+          data = Dataset.load_builtin("ml-100k", prompt=False)
+          _, testset = train_test_split(data, test_size=0.2, random_state=42)
+
+          rmse = accuracy.rmse(model.test(testset), verbose=False)
+          print(f"RMSE = {rmse:.4f}")
+
+          THRESHOLD = 1.05
+          if rmse > THRESHOLD:
+              raise SystemExit(f"FAIL: RMSE {rmse:.4f} exceeds threshold {THRESHOLD}")
+          print("Model quality gate passed.")
+          EOF
+
+  # ===========================================================================
+  # Docker Build Job
+  # ===========================================================================
+  docker-build:
+    name: Build Docker Image
+    runs-on: ubuntu-latest
+    needs: [test]
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: false
+          load: true
+          tags: movie-rating-api:ci
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Smoke test the container
+        # Building is not enough - the image must actually serve traffic.
+        run: |
+          docker run -d --name api-smoke -p 8000:8000 movie-rating-api:ci
+          for i in $(seq 1 20); do
+            if curl -sf http://localhost:8000/health; then
+              echo "Health check passed"
+              docker rm -f api-smoke
+              exit 0
+            fi
+            sleep 3
+          done
+          echo "Container failed to become healthy"
+          docker logs api-smoke
+          docker rm -f api-smoke
+          exit 1
+
+  # ===========================================================================
+  # Summary gate - one required status check for branch protection
+  # ===========================================================================
+  ci-success:
+    name: CI Success
+    runs-on: ubuntu-latest
+    needs: [lint, type-check, test, model-validate, docker-build]
+    if: always()
+    steps:
+      - name: Verify all jobs passed
+        run: |
+          if [ "${{ contains(needs.*.result, 'failure') }}" = "true" ]; then
+            echo "One or more CI jobs failed."
+            exit 1
+          fi
+          echo "All CI jobs passed."

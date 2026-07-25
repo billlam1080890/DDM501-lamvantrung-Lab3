@@ -1,0 +1,195 @@
+# =============================================================================
+# CD Pipeline for Movie Rating API
+# DDM501 - Lab 3: Testing & CI/CD
+#
+# Triggered by a version tag (v1.0.0). Builds and publishes the image to GHCR,
+# cuts a GitHub Release, deploys to staging, then to production behind a manual
+# environment approval.
+#
+# GHCR is used rather than Docker Hub so the workflow needs no external
+# secrets: GITHUB_TOKEN is issued automatically to every run.
+# =============================================================================
+
+name: CD Pipeline
+
+on:
+  push:
+    tags:
+      - 'v*'
+  # Allows a re-deploy of an existing tag without cutting a new one.
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Tag to deploy (e.g. v1.0.0)'
+        required: true
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+
+jobs:
+  # ===========================================================================
+  # Re-verify before shipping
+  # ===========================================================================
+  verify:
+    name: Verify Tests Pass
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt -r requirements-dev.txt
+
+      - name: Train model
+        run: python scripts/train_model.py
+
+      # CI already ran on the commit, but a tag can point at any commit - never
+      # publish an artifact whose tests were not verified at this exact ref.
+      - name: Run full test suite
+        run: pytest tests/ --cov=app --cov-fail-under=80
+
+  # ===========================================================================
+  # Build and Push Docker Image
+  # ===========================================================================
+  build-and-push:
+    name: Build and Push Docker Image
+    runs-on: ubuntu-latest
+    needs: [verify]
+
+    permissions:
+      contents: write     # required to create the GitHub Release
+      packages: write     # required to push to GHCR
+
+    outputs:
+      image-digest: ${{ steps.build.outputs.digest }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract image metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=raw,value=latest
+
+      - name: Build and push
+        id: build
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: Release ${{ github.ref_name }}
+          generate_release_notes: true
+          body: |
+            ## Movie Rating Prediction API ${{ github.ref_name }}
+
+            **Image:** `${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.ref_name }}`
+            **Digest:** `${{ steps.build.outputs.digest }}`
+
+            ```bash
+            docker pull ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.ref_name }}
+            ```
+          draft: false
+          prerelease: false
+
+  # ===========================================================================
+  # Deploy to Staging
+  # ===========================================================================
+  deploy-staging:
+    name: Deploy to Staging
+    runs-on: ubuntu-latest
+    needs: [build-and-push]
+    environment:
+      name: staging
+
+    permissions:
+      packages: read
+
+    steps:
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Deploy
+        run: |
+          echo "Deploying ${{ github.ref_name }} to staging..."
+          # A real deployment would target a cluster here, e.g.
+          #   kubectl set image deployment/movie-rating-api \
+          #     api=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.ref_name }}
+
+      - name: Smoke test the published image
+        run: |
+          docker run -d --name staging-smoke -p 8000:8000 \
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.ref_name }}
+          for i in $(seq 1 20); do
+            if curl -sf http://localhost:8000/health; then
+              echo "Staging smoke test passed"
+              docker rm -f staging-smoke
+              exit 0
+            fi
+            sleep 3
+          done
+          docker logs staging-smoke
+          docker rm -f staging-smoke
+          exit 1
+
+  # ===========================================================================
+  # Deploy to Production (manual approval)
+  # ===========================================================================
+  deploy-production:
+    name: Deploy to Production
+    runs-on: ubuntu-latest
+    needs: [deploy-staging]
+    # Configure this environment with a required reviewer in repo settings:
+    # the job then pauses here until a human approves the release.
+    environment:
+      name: production
+
+    steps:
+      - name: Deploy
+        run: |
+          echo "Deploying ${{ github.ref_name }} to production..."
+          # kubectl set image deployment/movie-rating-api \
+          #   api=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.ref_name }}
+
+      - name: Record deployment
+        run: |
+          echo "Deployed ${{ github.ref_name }} at $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          echo "Rollback: redeploy the previous tag via workflow_dispatch."

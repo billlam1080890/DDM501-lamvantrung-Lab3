@@ -1,0 +1,97 @@
+# =============================================================================
+# Pre-commit hooks configuration
+# DDM501 - Lab 3: Testing & CI/CD
+#
+# These mirror the CI lint job, so formatting failures are caught locally in
+# seconds instead of after a five-minute CI round trip.
+#
+# Setup:
+#   pip install pre-commit
+#   pre-commit install
+#
+# Run manually:
+#   pre-commit run --all-files
+# =============================================================================
+
+default_language_version:
+  python: python3.11
+
+exclude: '^(venv/|\.venv/|models/|htmlcov/)'
+
+repos:
+  # ===========================================================================
+  # Standard pre-commit hooks
+  # ===========================================================================
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v4.5.0
+    hooks:
+      - id: trailing-whitespace
+      - id: end-of-file-fixer
+      - id: check-yaml
+      - id: check-json
+      - id: check-added-large-files
+        args: ['--maxkb=1000']
+      - id: check-merge-conflict
+      - id: detect-private-key
+      - id: check-ast
+      - id: debug-statements
+
+  # ===========================================================================
+  # Black formatter
+  # ===========================================================================
+  - repo: https://github.com/psf/black
+    rev: 23.12.1
+    hooks:
+      - id: black
+        args: ['--line-length=100']
+
+  # ===========================================================================
+  # isort for import sorting
+  # ===========================================================================
+  - repo: https://github.com/pycqa/isort
+    rev: 5.13.2
+    hooks:
+      - id: isort
+        args: ['--profile=black', '--line-length=100']
+
+  # ===========================================================================
+  # Flake8 linter
+  # ===========================================================================
+  - repo: https://github.com/pycqa/flake8
+    rev: 7.0.0
+    hooks:
+      - id: flake8
+        args:
+          - '--max-line-length=100'
+          # E203/W503 conflict with Black's slice and line-break style.
+          - '--extend-ignore=E203,W503'
+          - '--exclude=__pycache__,venv'
+
+  # ===========================================================================
+  # mypy type checker
+  # ===========================================================================
+  - repo: https://github.com/pre-commit/mirrors-mypy
+    rev: v1.8.0
+    hooks:
+      - id: mypy
+        additional_dependencies:
+          - types-requests
+          - pydantic
+        args: ['--ignore-missing-imports']
+        # Tests use fixtures without annotations; type-check the app only.
+        files: '^app/'
+
+  # ===========================================================================
+  # Fast unit tests before every commit
+  # ===========================================================================
+  - repo: local
+    hooks:
+      - id: pytest-unit
+        name: pytest (unit tests)
+        # Only the unit tier runs here - it finishes in under a second. The
+        # integration/data/model tiers need the model artifact and run in CI.
+        entry: pytest tests/unit/ -q --tb=short
+        language: system
+        types: [python]
+        pass_filenames: false
+        always_run: true
